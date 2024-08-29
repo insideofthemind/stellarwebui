@@ -1,7 +1,7 @@
 from fastapi import Response, Request
 from fastapi import Depends, FastAPI, HTTPException, status
 from datetime import datetime, timedelta
-from typing import List, Union, Optional
+from typing import Union, Optional
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -30,7 +30,7 @@ async def get_embeddings(request: Request):
 ############################
 
 
-@router.get("/", response_model=List[MemoryModel])
+@router.get("/", response_model=list[MemoryModel])
 async def get_memories(user=Depends(get_verified_user)):
     return Memories.get_memories_by_user_id(user.id)
 
@@ -68,34 +68,6 @@ async def add_memory(
     return memory
 
 
-@router.post("/{memory_id}/update", response_model=Optional[MemoryModel])
-async def update_memory_by_id(
-    memory_id: str,
-    request: Request,
-    form_data: MemoryUpdateModel,
-    user=Depends(get_verified_user),
-):
-    memory = Memories.update_memory_by_id(memory_id, form_data.content)
-    if memory is None:
-        raise HTTPException(status_code=404, detail="Memory not found")
-
-    if form_data.content is not None:
-        memory_embedding = request.app.state.EMBEDDING_FUNCTION(form_data.content)
-        collection = CHROMA_CLIENT.get_or_create_collection(
-            name=f"user-memory-{user.id}"
-        )
-        collection.upsert(
-            documents=[form_data.content],
-            ids=[memory.id],
-            embeddings=[memory_embedding],
-            metadatas=[
-                {"created_at": memory.created_at, "updated_at": memory.updated_at}
-            ],
-        )
-
-    return memory
-
-
 ############################
 # QueryMemory
 ############################
@@ -124,7 +96,7 @@ async def query_memory(
 ############################
 # ResetMemoryFromVectorDB
 ############################
-@router.get("/reset", response_model=bool)
+@router.post("/reset", response_model=bool)
 async def reset_memory_from_vector_db(
     request: Request, user=Depends(get_verified_user)
 ):
@@ -147,7 +119,7 @@ async def reset_memory_from_vector_db(
 ############################
 
 
-@router.delete("/user", response_model=bool)
+@router.delete("/delete/user", response_model=bool)
 async def delete_memory_by_user_id(user=Depends(get_verified_user)):
     result = Memories.delete_memories_by_user_id(user.id)
 
@@ -159,6 +131,39 @@ async def delete_memory_by_user_id(user=Depends(get_verified_user)):
         return True
 
     return False
+
+
+############################
+# UpdateMemoryById
+############################
+
+
+@router.post("/{memory_id}/update", response_model=Optional[MemoryModel])
+async def update_memory_by_id(
+    memory_id: str,
+    request: Request,
+    form_data: MemoryUpdateModel,
+    user=Depends(get_verified_user),
+):
+    memory = Memories.update_memory_by_id(memory_id, form_data.content)
+    if memory is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    if form_data.content is not None:
+        memory_embedding = request.app.state.EMBEDDING_FUNCTION(form_data.content)
+        collection = CHROMA_CLIENT.get_or_create_collection(
+            name=f"user-memory-{user.id}"
+        )
+        collection.upsert(
+            documents=[form_data.content],
+            ids=[memory.id],
+            embeddings=[memory_embedding],
+            metadatas=[
+                {"created_at": memory.created_at, "updated_at": memory.updated_at}
+            ],
+        )
+
+    return memory
 
 
 ############################

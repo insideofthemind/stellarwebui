@@ -1,5 +1,5 @@
+import asyncio
 import websocket  # NOTE: websocket-client (https://github.com/websocket-client/websocket-client)
-import uuid
 import json
 import urllib.request
 import urllib.parse
@@ -14,116 +14,6 @@ log.setLevel(SRC_LOG_LEVELS["COMFYUI"])
 from pydantic import BaseModel
 
 from typing import Optional
-
-COMFYUI_DEFAULT_PROMPT = """
-{
-  "3": {
-    "inputs": {
-      "seed": 0,
-      "steps": 20,
-      "cfg": 8,
-      "sampler_name": "euler",
-      "scheduler": "normal",
-      "denoise": 1,
-      "model": [
-        "4",
-        0
-      ],
-      "positive": [
-        "6",
-        0
-      ],
-      "negative": [
-        "7",
-        0
-      ],
-      "latent_image": [
-        "5",
-        0
-      ]
-    },
-    "class_type": "KSampler",
-    "_meta": {
-      "title": "KSampler"
-    }
-  },
-  "4": {
-    "inputs": {
-      "ckpt_name": "model.safetensors"
-    },
-    "class_type": "CheckpointLoaderSimple",
-    "_meta": {
-      "title": "Load Checkpoint"
-    }
-  },
-  "5": {
-    "inputs": {
-      "width": 512,
-      "height": 512,
-      "batch_size": 1
-    },
-    "class_type": "EmptyLatentImage",
-    "_meta": {
-      "title": "Empty Latent Image"
-    }
-  },
-  "6": {
-    "inputs": {
-      "text": "Prompt",
-      "clip": [
-        "4",
-        1
-      ]
-    },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP Text Encode (Prompt)"
-    }
-  },
-  "7": {
-    "inputs": {
-      "text": "Negative Prompt",
-      "clip": [
-        "4",
-        1
-      ]
-    },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP Text Encode (Prompt)"
-    }
-  },
-  "8": {
-    "inputs": {
-      "samples": [
-        "3",
-        0
-      ],
-      "vae": [
-        "4",
-        2
-      ]
-    },
-    "class_type": "VAEDecode",
-    "_meta": {
-      "title": "VAE Decode"
-    }
-  },
-  "9": {
-    "inputs": {
-      "filename_prefix": "ComfyUI",
-      "images": [
-        "8",
-        0
-      ]
-    },
-    "class_type": "SaveImage",
-    "_meta": {
-      "title": "Save Image"
-    }
-  }
-}
-"""
 
 
 def queue_prompt(prompt, client_id, base_url):
@@ -182,54 +72,71 @@ def get_images(ws, prompt, client_id, base_url):
     return {"data": output_images}
 
 
-class ImageGenerationPayload(BaseModel):
+class ComfyUINodeInput(BaseModel):
+    type: Optional[str] = None
+    node_ids: list[str] = []
+    key: Optional[str] = "text"
+    value: Optional[str] = None
+
+
+class ComfyUIWorkflow(BaseModel):
+    workflow: str
+    nodes: list[ComfyUINodeInput]
+
+
+class ComfyUIGenerateImageForm(BaseModel):
+    workflow: ComfyUIWorkflow
+
     prompt: str
-    negative_prompt: Optional[str] = ""
-    steps: Optional[int] = None
-    seed: Optional[int] = None
+    negative_prompt: Optional[str] = None
     width: int
     height: int
     n: int = 1
-    cfg_scale: Optional[float] = None
-    sampler: Optional[str] = None
-    scheduler: Optional[str] = None
-    sd3: Optional[bool] = None
+
+    steps: Optional[int] = None
+    seed: Optional[int] = None
 
 
-def comfyui_generate_image(
-    model: str, payload: ImageGenerationPayload, client_id, base_url
+async def comfyui_generate_image(
+    model: str, payload: ComfyUIGenerateImageForm, client_id, base_url
 ):
     ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
+    workflow = json.loads(payload.workflow.workflow)
 
-    comfyui_prompt = json.loads(COMFYUI_DEFAULT_PROMPT)
-
-    if payload.cfg_scale:
-        comfyui_prompt["3"]["inputs"]["cfg"] = payload.cfg_scale
-
-    if payload.sampler:
-        comfyui_prompt["3"]["inputs"]["sampler"] = payload.sampler
-
-    if payload.scheduler:
-        comfyui_prompt["3"]["inputs"]["scheduler"] = payload.scheduler
-
-    if payload.sd3:
-        comfyui_prompt["5"]["class_type"] = "EmptySD3LatentImage"
-
-    comfyui_prompt["4"]["inputs"]["ckpt_name"] = model
-    comfyui_prompt["5"]["inputs"]["batch_size"] = payload.n
-    comfyui_prompt["5"]["inputs"]["width"] = payload.width
-    comfyui_prompt["5"]["inputs"]["height"] = payload.height
-
-    # set the text prompt for our positive CLIPTextEncode
-    comfyui_prompt["6"]["inputs"]["text"] = payload.prompt
-    comfyui_prompt["7"]["inputs"]["text"] = payload.negative_prompt
-
-    if payload.steps:
-        comfyui_prompt["3"]["inputs"]["steps"] = payload.steps
-
-    comfyui_prompt["3"]["inputs"]["seed"] = (
-        payload.seed if payload.seed else random.randint(0, 18446744073709551614)
-    )
+    for node in payload.workflow.nodes:
+        if node.type:
+            if node.type == "model":
+                for node_id in node.node_ids:
+                    workflow[node_id]["inputs"][node.key] = model
+            elif node.type == "prompt":
+                for node_id in node.node_ids:
+                    workflow[node_id]["inputs"]["text"] = payload.prompt
+            elif node.type == "negative_prompt":
+                for node_id in node.node_ids:
+                    workflow[node_id]["inputs"]["text"] = payload.negative_prompt
+            elif node.type == "width":
+                for node_id in node.node_ids:
+                    workflow[node_id]["inputs"]["width"] = payload.width
+            elif node.type == "height":
+                for node_id in node.node_ids:
+                    workflow[node_id]["inputs"]["height"] = payload.height
+            elif node.type == "n":
+                for node_id in node.node_ids:
+                    workflow[node_id]["inputs"]["batch_size"] = payload.n
+            elif node.type == "steps":
+                for node_id in node.node_ids:
+                    workflow[node_id]["inputs"]["steps"] = payload.steps
+            elif node.type == "seed":
+                seed = (
+                    payload.seed
+                    if payload.seed
+                    else random.randint(0, 18446744073709551614)
+                )
+                for node_id in node.node_ids:
+                    workflow[node_id]["inputs"][node.key] = seed
+        else:
+            for node_id in node.node_ids:
+                workflow[node_id]["inputs"][node.key] = node.value
 
     try:
         ws = websocket.WebSocket()
@@ -240,7 +147,9 @@ def comfyui_generate_image(
         return None
 
     try:
-        images = get_images(ws, comfyui_prompt, client_id, base_url)
+        log.info("Sending workflow to WebSocket server.")
+        log.info(f"Workflow: {workflow}")
+        images = await asyncio.to_thread(get_images, ws, workflow, client_id, base_url)
     except Exception as e:
         log.exception(f"Error while receiving images: {e}")
         images = None

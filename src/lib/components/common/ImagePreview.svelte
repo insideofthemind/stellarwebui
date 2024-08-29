@@ -1,11 +1,13 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 
 	export let show = false;
 	export let src = '';
 	export let alt = '';
 
 	let mounted = false;
+
+	let previewElement = null;
 
 	const downloadImage = (url, filename) => {
 		fetch(url)
@@ -34,24 +36,33 @@
 		mounted = true;
 	});
 
-	$: if (mounted) {
-		if (show) {
-			window.addEventListener('keydown', handleKeyDown);
-			document.body.style.overflow = 'hidden';
-		} else {
-			window.removeEventListener('keydown', handleKeyDown);
-			document.body.style.overflow = 'unset';
-		}
+	$: if (show && previewElement) {
+		document.body.appendChild(previewElement);
+		window.addEventListener('keydown', handleKeyDown);
+		document.body.style.overflow = 'hidden';
+	} else if (previewElement) {
+		window.removeEventListener('keydown', handleKeyDown);
+		document.body.removeChild(previewElement);
+		document.body.style.overflow = 'unset';
 	}
+
+	onDestroy(() => {
+		show = false;
+
+		if (previewElement) {
+			document.body.removeChild(previewElement);
+		}
+	});
 </script>
 
 {#if show}
 	<!-- svelte-ignore a11y-click-events-have-key-events -->
 	<!-- svelte-ignore a11y-no-static-element-interactions -->
 	<div
-		class="fixed top-0 right-0 left-0 bottom-0 bg-black text-white w-full min-h-screen h-screen flex justify-center z-50 overflow-hidden overscroll-contain"
+		bind:this={previewElement}
+		class="modal fixed top-0 right-0 left-0 bottom-0 bg-black text-white w-full min-h-screen h-screen flex justify-center z-[9999] overflow-hidden overscroll-contain"
 	>
-		<div class=" absolute left-0 w-full flex justify-between">
+		<div class=" absolute left-0 w-full flex justify-between select-none">
 			<div>
 				<button
 					class=" p-5"
@@ -95,6 +106,6 @@
 				</button>
 			</div>
 		</div>
-		<img {src} {alt} class=" mx-auto h-full object-scale-down" />
+		<img {src} {alt} class=" mx-auto h-full object-scale-down select-none" draggable="false" />
 	</div>
 {/if}

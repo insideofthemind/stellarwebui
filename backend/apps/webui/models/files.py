@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict
-from typing import List, Union, Optional
+from typing import Union, Optional
 import time
 import logging
 
@@ -9,7 +9,7 @@ from apps.webui.internal.db import JSONField, Base, get_db
 
 import json
 
-from config import SRC_LOG_LEVELS
+from env import SRC_LOG_LEVELS
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -90,13 +90,20 @@ class FilesTable:
             try:
                 file = db.get(File, id)
                 return FileModel.model_validate(file)
-            except:
+            except Exception:
                 return None
 
-    def get_files(self) -> List[FileModel]:
+    def get_files(self) -> list[FileModel]:
         with get_db() as db:
 
             return [FileModel.model_validate(file) for file in db.query(File).all()]
+
+    def get_files_by_user_id(self, user_id: str) -> list[FileModel]:
+        with get_db() as db:
+            return [
+                FileModel.model_validate(file)
+                for file in db.query(File).filter_by(user_id=user_id).all()
+            ]
 
     def delete_file_by_id(self, id: str) -> bool:
 
@@ -107,7 +114,7 @@ class FilesTable:
                 db.commit()
 
                 return True
-            except:
+            except Exception:
                 return False
 
     def delete_all_files(self) -> bool:
@@ -119,7 +126,7 @@ class FilesTable:
                 db.commit()
 
                 return True
-            except:
+            except Exception:
                 return False
 
 

@@ -1,11 +1,17 @@
+from sqlalchemy import create_engine, Column, Integer, DateTime, JSON, func
+from contextlib import contextmanager
+
+
 import os
 import sys
 import logging
 import importlib.metadata
 import pkgutil
+from urllib.parse import urlparse
+from datetime import datetime
+
 import chromadb
 from chromadb import Settings
-from bs4 import BeautifulSoup
 from typing import TypeVar, Generic
 from pydantic import BaseModel
 from typing import Optional
@@ -14,196 +20,103 @@ from pathlib import Path
 import json
 import yaml
 
-import markdown
 import requests
 import shutil
 
+
+from apps.webui.internal.db import Base, get_db
+
 from constants import ERROR_MESSAGES
 
-####################################
-# Load .env file
-####################################
-
-BACKEND_DIR = Path(__file__).parent  # the path containing this file
-BASE_DIR = BACKEND_DIR.parent  # the path containing the backend/
-
-print(BASE_DIR)
-
-try:
-    from dotenv import load_dotenv, find_dotenv
-
-    load_dotenv(find_dotenv(str(BASE_DIR / ".env")))
-except ImportError:
-    print("dotenv not installed, skipping...")
-
-
-####################################
-# LOGGING
-####################################
-
-log_levels = ["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
-
-GLOBAL_LOG_LEVEL = os.environ.get("GLOBAL_LOG_LEVEL", "").upper()
-if GLOBAL_LOG_LEVEL in log_levels:
-    logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL, force=True)
-else:
-    GLOBAL_LOG_LEVEL = "INFO"
-
-log = logging.getLogger(__name__)
-log.info(f"GLOBAL_LOG_LEVEL: {GLOBAL_LOG_LEVEL}")
-
-log_sources = [
-    "AUDIO",
-    "COMFYUI",
-    "CONFIG",
-    "DB",
-    "IMAGES",
-    "MAIN",
-    "MODELS",
-    "OLLAMA",
-    "OPENAI",
-    "RAG",
-    "WEBHOOK",
-]
-
-SRC_LOG_LEVELS = {}
-
-for source in log_sources:
-    log_env_var = source + "_LOG_LEVEL"
-    SRC_LOG_LEVELS[source] = os.environ.get(log_env_var, "").upper()
-    if SRC_LOG_LEVELS[source] not in log_levels:
-        SRC_LOG_LEVELS[source] = GLOBAL_LOG_LEVEL
-    log.info(f"{log_env_var}: {SRC_LOG_LEVELS[source]}")
-
-log.setLevel(SRC_LOG_LEVELS["CONFIG"])
-
-WEBUI_NAME = os.environ.get("WEBUI_NAME", "Open WebUI")
-if WEBUI_NAME != "Open WebUI":
-    WEBUI_NAME += " (Open WebUI)"
-
-WEBUI_URL = os.environ.get("WEBUI_URL", "http://localhost:3000")
-
-WEBUI_FAVICON_URL = "https://openwebui.com/favicon.png"
-
-
-####################################
-# ENV (dev,test,prod)
-####################################
-
-ENV = os.environ.get("ENV", "dev")
-
-try:
-    PACKAGE_DATA = json.loads((BASE_DIR / "package.json").read_text())
-except:
-    try:
-        PACKAGE_DATA = {"version": importlib.metadata.version("open-webui")}
-    except importlib.metadata.PackageNotFoundError:
-        PACKAGE_DATA = {"version": "0.0.0"}
-
-VERSION = PACKAGE_DATA["version"]
-
-
-# Function to parse each section
-def parse_section(section):
-    items = []
-    for li in section.find_all("li"):
-        # Extract raw HTML string
-        raw_html = str(li)
-
-        # Extract text without HTML tags
-        text = li.get_text(separator=" ", strip=True)
-
-        # Split into title and content
-        parts = text.split(": ", 1)
-        title = parts[0].strip() if len(parts) > 1 else ""
-        content = parts[1].strip() if len(parts) > 1 else text
-
-        items.append({"title": title, "content": content, "raw": raw_html})
-    return items
-
-
-try:
-    changelog_path = BASE_DIR / "CHANGELOG.md"
-    with open(str(changelog_path.absolute()), "r", encoding="utf8") as file:
-        changelog_content = file.read()
-
-except:
-    changelog_content = (pkgutil.get_data("open_webui", "CHANGELOG.md") or b"").decode()
-
-
-# Convert markdown content to HTML
-html_content = markdown.markdown(changelog_content)
-
-# Parse the HTML content
-soup = BeautifulSoup(html_content, "html.parser")
-
-# Initialize JSON structure
-changelog_json = {}
-
-# Iterate over each version
-for version in soup.find_all("h2"):
-    version_number = version.get_text().strip().split(" - ")[0][1:-1]  # Remove brackets
-    date = version.get_text().strip().split(" - ")[1]
-
-    version_data = {"date": date}
-
-    # Find the next sibling that is a h3 tag (section title)
-    current = version.find_next_sibling()
-
-    while current and current.name != "h2":
-        if current.name == "h3":
-            section_title = current.get_text().lower()  # e.g., "added", "fixed"
-            section_items = parse_section(current.find_next_sibling("ul"))
-            version_data[section_title] = section_items
-
-        # Move to the next element
-        current = current.find_next_sibling()
-
-    changelog_json[version_number] = version_data
-
-
-CHANGELOG = changelog_json
-
-
-####################################
-# SAFE_MODE
-####################################
-
-SAFE_MODE = os.environ.get("SAFE_MODE", "false").lower() == "true"
-
-####################################
-# WEBUI_BUILD_HASH
-####################################
-
-WEBUI_BUILD_HASH = os.environ.get("WEBUI_BUILD_HASH", "dev-build")
-
-####################################
-# DATA/FRONTEND BUILD DIR
-####################################
-
-DATA_DIR = Path(os.getenv("DATA_DIR", BACKEND_DIR / "data")).resolve()
-FRONTEND_BUILD_DIR = Path(os.getenv("FRONTEND_BUILD_DIR", BASE_DIR / "build")).resolve()
-
-RESET_CONFIG_ON_START = (
-    os.environ.get("RESET_CONFIG_ON_START", "False").lower() == "true"
+from env import (
+    ENV,
+    VERSION,
+    SAFE_MODE,
+    GLOBAL_LOG_LEVEL,
+    SRC_LOG_LEVELS,
+    BASE_DIR,
+    DATA_DIR,
+    BACKEND_DIR,
+    FRONTEND_BUILD_DIR,
+    WEBUI_NAME,
+    WEBUI_URL,
+    WEBUI_FAVICON_URL,
+    WEBUI_BUILD_HASH,
+    CONFIG_DATA,
+    DATABASE_URL,
+    CHANGELOG,
+    WEBUI_AUTH,
+    WEBUI_AUTH_TRUSTED_EMAIL_HEADER,
+    WEBUI_AUTH_TRUSTED_NAME_HEADER,
+    WEBUI_SECRET_KEY,
+    WEBUI_SESSION_COOKIE_SAME_SITE,
+    WEBUI_SESSION_COOKIE_SECURE,
+    log,
 )
-if RESET_CONFIG_ON_START:
-    try:
-        os.remove(f"{DATA_DIR}/config.json")
-        with open(f"{DATA_DIR}/config.json", "w") as f:
-            f.write("{}")
-    except:
-        pass
 
-try:
-    CONFIG_DATA = json.loads((DATA_DIR / "config.json").read_text())
-except:
-    CONFIG_DATA = {}
 
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage().find("/health") == -1
+
+
+# Filter out /endpoint
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
 ####################################
 # Config helpers
 ####################################
+
+
+# Function to run the alembic migrations
+def run_migrations():
+    print("Running migrations")
+    try:
+        from alembic.config import Config
+        from alembic import command
+
+        alembic_cfg = Config("alembic.ini")
+        command.upgrade(alembic_cfg, "head")
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+run_migrations()
+
+
+class Config(Base):
+    __tablename__ = "config"
+
+    id = Column(Integer, primary_key=True)
+    data = Column(JSON, nullable=False)
+    version = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=True, onupdate=func.now())
+
+
+def load_json_config():
+    with open(f"{DATA_DIR}/config.json", "r") as file:
+        return json.load(file)
+
+
+def save_to_db(data):
+    with get_db() as db:
+        existing_config = db.query(Config).first()
+        if not existing_config:
+            new_config = Config(data=data, version=0)
+            db.add(new_config)
+        else:
+            existing_config.data = data
+            existing_config.updated_at = datetime.now()
+            db.add(existing_config)
+        db.commit()
+
+
+# When initializing, check if config.json exists and migrate it to the database
+if os.path.exists(f"{DATA_DIR}/config.json"):
+    data = load_json_config()
+    save_to_db(data)
+    os.rename(f"{DATA_DIR}/config.json", f"{DATA_DIR}/old_config.json")
 
 
 def save_config():
@@ -212,6 +125,68 @@ def save_config():
             json.dump(CONFIG_DATA, f, indent="\t")
     except Exception as e:
         log.exception(e)
+
+
+DEFAULT_CONFIG = {
+    "version": 0,
+    "ui": {
+        "default_locale": "",
+        "prompt_suggestions": [
+            {
+                "title": [
+                    "Help me study",
+                    "vocabulary for a college entrance exam",
+                ],
+                "content": "Help me study vocabulary: write a sentence for me to fill in the blank, and I'll try to pick the correct option.",
+            },
+            {
+                "title": [
+                    "Give me ideas",
+                    "for what to do with my kids' art",
+                ],
+                "content": "What are 5 creative things I could do with my kids' art? I don't want to throw them away, but it's also so much clutter.",
+            },
+            {
+                "title": ["Tell me a fun fact", "about the Roman Empire"],
+                "content": "Tell me a random fun fact about the Roman Empire",
+            },
+            {
+                "title": [
+                    "Show me a code snippet",
+                    "of a website's sticky header",
+                ],
+                "content": "Show me a code snippet of a website's sticky header in CSS and JavaScript.",
+            },
+            {
+                "title": [
+                    "Explain options trading",
+                    "if I'm familiar with buying and selling stocks",
+                ],
+                "content": "Explain options trading in simple terms if I'm familiar with buying and selling stocks.",
+            },
+            {
+                "title": ["Overcome procrastination", "give me tips"],
+                "content": "Could you start by asking me about instances when I procrastinate the most and then give me some suggestions to overcome it?",
+            },
+            {
+                "title": [
+                    "Grammar check",
+                    "rewrite it for better readability ",
+                ],
+                "content": 'Check the following sentence for grammar and clarity: "[sentence]". Rewrite it for better readability while maintaining its original meaning.',
+            },
+        ],
+    },
+}
+
+
+def get_config():
+    with get_db() as db:
+        config_entry = db.query(Config).order_by(Config.id.desc()).first()
+        return config_entry.data if config_entry else DEFAULT_CONFIG
+
+
+CONFIG_DATA = get_config()
 
 
 def get_config_value(config_path: str):
@@ -235,7 +210,7 @@ class PersistentConfig(Generic[T]):
         self.env_value = env_value
         self.config_value = get_config_value(config_path)
         if self.config_value is not None:
-            log.info(f"'{env_name}' loaded from config.json")
+            log.info(f"'{env_name}' loaded from the latest database entry")
             self.value = self.config_value
         else:
             self.value = env_value
@@ -257,19 +232,15 @@ class PersistentConfig(Generic[T]):
         return super().__getattribute__(item)
 
     def save(self):
-        # Don't save if the value is the same as the env value and the config value
-        if self.env_value == self.value:
-            if self.config_value == self.value:
-                return
-        log.info(f"Saving '{self.env_name}' to config.json")
+        log.info(f"Saving '{self.env_name}' to the database")
         path_parts = self.config_path.split(".")
-        config = CONFIG_DATA
+        sub_config = CONFIG_DATA
         for key in path_parts[:-1]:
-            if key not in config:
-                config[key] = {}
-            config = config[key]
-        config[path_parts[-1]] = self.value
-        save_config()
+            if key not in sub_config:
+                sub_config[key] = {}
+            sub_config = sub_config[key]
+        sub_config[path_parts[-1]] = self.value
+        save_to_db(CONFIG_DATA)
         self.config_value = self.value
 
 
@@ -294,11 +265,6 @@ class AppConfig:
 # WEBUI_AUTH (Required for security)
 ####################################
 
-WEBUI_AUTH = os.environ.get("WEBUI_AUTH", "True").lower() == "true"
-WEBUI_AUTH_TRUSTED_EMAIL_HEADER = os.environ.get(
-    "WEBUI_AUTH_TRUSTED_EMAIL_HEADER", None
-)
-WEBUI_AUTH_TRUSTED_NAME_HEADER = os.environ.get("WEBUI_AUTH_TRUSTED_NAME_HEADER", None)
 JWT_EXPIRES_IN = PersistentConfig(
     "JWT_EXPIRES_IN", "auth.jwt_expiry", os.environ.get("JWT_EXPIRES_IN", "-1")
 )
@@ -339,6 +305,12 @@ GOOGLE_OAUTH_SCOPE = PersistentConfig(
     os.environ.get("GOOGLE_OAUTH_SCOPE", "openid email profile"),
 )
 
+GOOGLE_REDIRECT_URI = PersistentConfig(
+    "GOOGLE_REDIRECT_URI",
+    "oauth.google.redirect_uri",
+    os.environ.get("GOOGLE_REDIRECT_URI", ""),
+)
+
 MICROSOFT_CLIENT_ID = PersistentConfig(
     "MICROSOFT_CLIENT_ID",
     "oauth.microsoft.client_id",
@@ -363,6 +335,12 @@ MICROSOFT_OAUTH_SCOPE = PersistentConfig(
     os.environ.get("MICROSOFT_OAUTH_SCOPE", "openid email profile"),
 )
 
+MICROSOFT_REDIRECT_URI = PersistentConfig(
+    "MICROSOFT_REDIRECT_URI",
+    "oauth.microsoft.redirect_uri",
+    os.environ.get("MICROSOFT_REDIRECT_URI", ""),
+)
+
 OAUTH_CLIENT_ID = PersistentConfig(
     "OAUTH_CLIENT_ID",
     "oauth.oidc.client_id",
@@ -379,6 +357,12 @@ OPENID_PROVIDER_URL = PersistentConfig(
     "OPENID_PROVIDER_URL",
     "oauth.oidc.provider_url",
     os.environ.get("OPENID_PROVIDER_URL", ""),
+)
+
+OPENID_REDIRECT_URI = PersistentConfig(
+    "OPENID_REDIRECT_URI",
+    "oauth.oidc.redirect_uri",
+    os.environ.get("OPENID_REDIRECT_URI", ""),
 )
 
 OAUTH_SCOPES = PersistentConfig(
@@ -405,6 +389,12 @@ OAUTH_PICTURE_CLAIM = PersistentConfig(
     os.environ.get("OAUTH_PICTURE_CLAIM", "picture"),
 )
 
+OAUTH_EMAIL_CLAIM = PersistentConfig(
+    "OAUTH_EMAIL_CLAIM",
+    "oauth.oidc.email_claim",
+    os.environ.get("OAUTH_EMAIL_CLAIM", "email"),
+)
+
 
 def load_oauth_providers():
     OAUTH_PROVIDERS.clear()
@@ -414,6 +404,7 @@ def load_oauth_providers():
             "client_secret": GOOGLE_CLIENT_SECRET.value,
             "server_metadata_url": "https://accounts.google.com/.well-known/openid-configuration",
             "scope": GOOGLE_OAUTH_SCOPE.value,
+            "redirect_uri": GOOGLE_REDIRECT_URI.value,
         }
 
     if (
@@ -426,6 +417,7 @@ def load_oauth_providers():
             "client_secret": MICROSOFT_CLIENT_SECRET.value,
             "server_metadata_url": f"https://login.microsoftonline.com/{MICROSOFT_CLIENT_TENANT_ID.value}/v2.0/.well-known/openid-configuration",
             "scope": MICROSOFT_OAUTH_SCOPE.value,
+            "redirect_uri": MICROSOFT_REDIRECT_URI.value,
         }
 
     if (
@@ -439,6 +431,7 @@ def load_oauth_providers():
             "server_metadata_url": OPENID_PROVIDER_URL.value,
             "scope": OAUTH_SCOPES.value,
             "name": OAUTH_PROVIDER_NAME.value,
+            "redirect_uri": OPENID_REDIRECT_URI.value,
         }
 
 
@@ -610,7 +603,7 @@ if AIOHTTP_CLIENT_TIMEOUT == "":
 else:
     try:
         AIOHTTP_CLIENT_TIMEOUT = int(AIOHTTP_CLIENT_TIMEOUT)
-    except:
+    except Exception:
         AIOHTTP_CLIENT_TIMEOUT = 300
 
 
@@ -690,7 +683,7 @@ try:
     OPENAI_API_KEY = OPENAI_API_KEYS.value[
         OPENAI_API_BASE_URLS.value.index("https://api.openai.com/v1")
     ]
-except:
+except Exception:
     pass
 
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
@@ -707,6 +700,12 @@ ENABLE_SIGNUP = PersistentConfig(
         if not WEBUI_AUTH
         else os.environ.get("ENABLE_SIGNUP", "True").lower() == "true"
     ),
+)
+
+ENABLE_LOGIN_FORM = PersistentConfig(
+    "ENABLE_LOGIN_FORM",
+    "ui.ENABLE_LOGIN_FORM",
+    os.environ.get("ENABLE_LOGIN_FORM", "True").lower() == "true",
 )
 
 DEFAULT_LOCALE = PersistentConfig(
@@ -763,10 +762,24 @@ USER_PERMISSIONS_CHAT_DELETION = (
     os.environ.get("USER_PERMISSIONS_CHAT_DELETION", "True").lower() == "true"
 )
 
+USER_PERMISSIONS_CHAT_EDITING = (
+    os.environ.get("USER_PERMISSIONS_CHAT_EDITING", "True").lower() == "true"
+)
+
+USER_PERMISSIONS_CHAT_TEMPORARY = (
+    os.environ.get("USER_PERMISSIONS_CHAT_TEMPORARY", "True").lower() == "true"
+)
+
 USER_PERMISSIONS = PersistentConfig(
     "USER_PERMISSIONS",
     "ui.user_permissions",
-    {"chat": {"deletion": USER_PERMISSIONS_CHAT_DELETION}},
+    {
+        "chat": {
+            "deletion": USER_PERMISSIONS_CHAT_DELETION,
+            "editing": USER_PERMISSIONS_CHAT_EDITING,
+            "temporary": USER_PERMISSIONS_CHAT_TEMPORARY,
+        }
+    },
 )
 
 ENABLE_MODEL_FILTER = PersistentConfig(
@@ -787,11 +800,56 @@ WEBHOOK_URL = PersistentConfig(
 
 ENABLE_ADMIN_EXPORT = os.environ.get("ENABLE_ADMIN_EXPORT", "True").lower() == "true"
 
+ENABLE_ADMIN_CHAT_ACCESS = (
+    os.environ.get("ENABLE_ADMIN_CHAT_ACCESS", "True").lower() == "true"
+)
+
 ENABLE_COMMUNITY_SHARING = PersistentConfig(
     "ENABLE_COMMUNITY_SHARING",
     "ui.enable_community_sharing",
     os.environ.get("ENABLE_COMMUNITY_SHARING", "True").lower() == "true",
 )
+
+ENABLE_MESSAGE_RATING = PersistentConfig(
+    "ENABLE_MESSAGE_RATING",
+    "ui.enable_message_rating",
+    os.environ.get("ENABLE_MESSAGE_RATING", "True").lower() == "true",
+)
+
+
+def validate_cors_origins(origins):
+    for origin in origins:
+        if origin != "*":
+            validate_cors_origin(origin)
+
+
+def validate_cors_origin(origin):
+    parsed_url = urlparse(origin)
+
+    # Check if the scheme is either http or https
+    if parsed_url.scheme not in ["http", "https"]:
+        raise ValueError(
+            f"Invalid scheme in CORS_ALLOW_ORIGIN: '{origin}'. Only 'http' and 'https' are allowed."
+        )
+
+    # Ensure that the netloc (domain + port) is present, indicating it's a valid URL
+    if not parsed_url.netloc:
+        raise ValueError(f"Invalid URL structure in CORS_ALLOW_ORIGIN: '{origin}'.")
+
+
+# For production, you should only need one host as
+# fastapi serves the svelte-kit built frontend and backend from the same host and port.
+# To test CORS_ALLOW_ORIGIN locally, you can set something like
+# CORS_ALLOW_ORIGIN=http://localhost:5173;http://localhost:8080
+# in your .env file depending on your frontend port, 5173 in this case.
+CORS_ALLOW_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*").split(";")
+
+if "*" in CORS_ALLOW_ORIGIN:
+    log.warning(
+        "\n\nWARNING: CORS_ALLOW_ORIGIN IS SET TO '*' - NOT RECOMMENDED FOR PRODUCTION DEPLOYMENTS.\n"
+    )
+
+validate_cors_origins(CORS_ALLOW_ORIGIN)
 
 
 class BannerModel(BaseModel):
@@ -848,10 +906,7 @@ TITLE_GENERATION_PROMPT_TEMPLATE = PersistentConfig(
     "task.title.prompt_template",
     os.environ.get(
         "TITLE_GENERATION_PROMPT_TEMPLATE",
-        """Here is the query:
-{{prompt:middletruncate:8000}}
-
-Create a concise, 3-5 word phrase with an emoji as a title for the previous query. Suitable Emojis for the summary can be used to enhance understanding but avoid quotation marks or special formatting. RESPOND ONLY WITH THE TITLE TEXT.
+        """Create a concise, 3-5 word title with an emoji as a title for the prompt in the given language. Suitable Emojis for the summary can be used to enhance understanding but avoid quotation marks or special formatting. RESPOND ONLY WITH THE TITLE TEXT.
 
 Examples of titles:
 📉 Stock Market Trends
@@ -859,7 +914,9 @@ Examples of titles:
 Evolution of Music Streaming
 Remote Work Productivity Tips
 Artificial Intelligence in Healthcare
-🎮 Video Game Development Insights""",
+🎮 Video Game Development Insights
+
+Prompt: {{prompt:middletruncate:8000}}""",
     ),
 )
 
@@ -892,35 +949,10 @@ TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = PersistentConfig(
     "task.tools.prompt_template",
     os.environ.get(
         "TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE",
-        """Tools: {{TOOLS}}
-If a function tool doesn't match the query, return an empty string. Else, pick a function tool, fill in the parameters from the function tool's schema, and return it in the format { "name": \"functionName\", "parameters": { "key": "value" } }. Only pick a function if the user asks.  Only return the object. Do not return any other text.""",
+        """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text.""",
     ),
 )
 
-
-####################################
-# WEBUI_SECRET_KEY
-####################################
-
-WEBUI_SECRET_KEY = os.environ.get(
-    "WEBUI_SECRET_KEY",
-    os.environ.get(
-        "WEBUI_JWT_SECRET_KEY", "t0p-s3cr3t"
-    ),  # DEPRECATED: remove at next major version
-)
-
-WEBUI_SESSION_COOKIE_SAME_SITE = os.environ.get(
-    "WEBUI_SESSION_COOKIE_SAME_SITE",
-    os.environ.get("WEBUI_SESSION_COOKIE_SAME_SITE", "lax"),
-)
-
-WEBUI_SESSION_COOKIE_SECURE = os.environ.get(
-    "WEBUI_SESSION_COOKIE_SECURE",
-    os.environ.get("WEBUI_SESSION_COOKIE_SECURE", "false").lower() == "true",
-)
-
-if WEBUI_AUTH and WEBUI_SECRET_KEY == "":
-    raise ValueError(ERROR_MESSAGES.ENV_VAR_NOT_FOUND)
 
 ####################################
 # RAG document content extraction
@@ -973,6 +1005,26 @@ ENABLE_RAG_HYBRID_SEARCH = PersistentConfig(
     os.environ.get("ENABLE_RAG_HYBRID_SEARCH", "").lower() == "true",
 )
 
+RAG_FILE_MAX_COUNT = PersistentConfig(
+    "RAG_FILE_MAX_COUNT",
+    "rag.file.max_count",
+    (
+        int(os.environ.get("RAG_FILE_MAX_COUNT"))
+        if os.environ.get("RAG_FILE_MAX_COUNT")
+        else None
+    ),
+)
+
+RAG_FILE_MAX_SIZE = PersistentConfig(
+    "RAG_FILE_MAX_SIZE",
+    "rag.file.max_size",
+    (
+        int(os.environ.get("RAG_FILE_MAX_SIZE"))
+        if os.environ.get("RAG_FILE_MAX_SIZE")
+        else None
+    ),
+)
+
 ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION = PersistentConfig(
     "ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION",
     "rag.enable_web_loader_ssl_verification",
@@ -996,7 +1048,7 @@ RAG_EMBEDDING_MODEL = PersistentConfig(
     "rag.embedding_model",
     os.environ.get("RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
 )
-log.info(f"Embedding model set: {RAG_EMBEDDING_MODEL.value}"),
+log.info(f"Embedding model set: {RAG_EMBEDDING_MODEL.value}")
 
 RAG_EMBEDDING_MODEL_AUTO_UPDATE = (
     os.environ.get("RAG_EMBEDDING_MODEL_AUTO_UPDATE", "").lower() == "true"
@@ -1009,7 +1061,7 @@ RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE = (
 RAG_EMBEDDING_OPENAI_BATCH_SIZE = PersistentConfig(
     "RAG_EMBEDDING_OPENAI_BATCH_SIZE",
     "rag.embedding_openai_batch_size",
-    os.environ.get("RAG_EMBEDDING_OPENAI_BATCH_SIZE", 1),
+    int(os.environ.get("RAG_EMBEDDING_OPENAI_BATCH_SIZE", "1")),
 )
 
 RAG_RERANKING_MODEL = PersistentConfig(
@@ -1018,7 +1070,7 @@ RAG_RERANKING_MODEL = PersistentConfig(
     os.environ.get("RAG_RERANKING_MODEL", ""),
 )
 if RAG_RERANKING_MODEL.value != "":
-    log.info(f"Reranking model set: {RAG_RERANKING_MODEL.value}"),
+    log.info(f"Reranking model set: {RAG_RERANKING_MODEL.value}")
 
 RAG_RERANKING_MODEL_AUTO_UPDATE = (
     os.environ.get("RAG_RERANKING_MODEL_AUTO_UPDATE", "").lower() == "true"
@@ -1216,7 +1268,7 @@ WHISPER_MODEL_AUTO_UPDATE = (
 IMAGE_GENERATION_ENGINE = PersistentConfig(
     "IMAGE_GENERATION_ENGINE",
     "image_generation.engine",
-    os.getenv("IMAGE_GENERATION_ENGINE", ""),
+    os.getenv("IMAGE_GENERATION_ENGINE", "openai"),
 )
 
 ENABLE_IMAGE_GENERATION = PersistentConfig(
@@ -1241,28 +1293,127 @@ COMFYUI_BASE_URL = PersistentConfig(
     os.getenv("COMFYUI_BASE_URL", ""),
 )
 
-COMFYUI_CFG_SCALE = PersistentConfig(
-    "COMFYUI_CFG_SCALE",
-    "image_generation.comfyui.cfg_scale",
-    os.getenv("COMFYUI_CFG_SCALE", ""),
+COMFYUI_DEFAULT_WORKFLOW = """
+{
+  "3": {
+    "inputs": {
+      "seed": 0,
+      "steps": 20,
+      "cfg": 8,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1,
+      "model": [
+        "4",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "4": {
+    "inputs": {
+      "ckpt_name": "model.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "5": {
+    "inputs": {
+      "width": 512,
+      "height": 512,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "Empty Latent Image"
+    }
+  },
+  "6": {
+    "inputs": {
+      "text": "Prompt",
+      "clip": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "3",
+        0
+      ],
+      "vae": [
+        "4",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "9": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}
+"""
+
+
+COMFYUI_WORKFLOW = PersistentConfig(
+    "COMFYUI_WORKFLOW",
+    "image_generation.comfyui.workflow",
+    os.getenv("COMFYUI_WORKFLOW", COMFYUI_DEFAULT_WORKFLOW),
 )
 
-COMFYUI_SAMPLER = PersistentConfig(
-    "COMFYUI_SAMPLER",
-    "image_generation.comfyui.sampler",
-    os.getenv("COMFYUI_SAMPLER", ""),
-)
-
-COMFYUI_SCHEDULER = PersistentConfig(
-    "COMFYUI_SCHEDULER",
-    "image_generation.comfyui.scheduler",
-    os.getenv("COMFYUI_SCHEDULER", ""),
-)
-
-COMFYUI_SD3 = PersistentConfig(
-    "COMFYUI_SD3",
-    "image_generation.comfyui.sd3",
-    os.environ.get("COMFYUI_SD3", "").lower() == "true",
+COMFYUI_WORKFLOW_NODES = PersistentConfig(
+    "COMFYUI_WORKFLOW",
+    "image_generation.comfyui.nodes",
+    [],
 )
 
 IMAGES_OPENAI_API_BASE_URL = PersistentConfig(
@@ -1329,6 +1480,11 @@ AUDIO_TTS_OPENAI_API_KEY = PersistentConfig(
     os.getenv("AUDIO_TTS_OPENAI_API_KEY", OPENAI_API_KEY),
 )
 
+AUDIO_TTS_API_KEY = PersistentConfig(
+    "AUDIO_TTS_API_KEY",
+    "audio.tts.api_key",
+    os.getenv("AUDIO_TTS_API_KEY", ""),
+)
 
 AUDIO_TTS_ENGINE = PersistentConfig(
     "AUDIO_TTS_ENGINE",
@@ -1340,22 +1496,17 @@ AUDIO_TTS_ENGINE = PersistentConfig(
 AUDIO_TTS_MODEL = PersistentConfig(
     "AUDIO_TTS_MODEL",
     "audio.tts.model",
-    os.getenv("AUDIO_TTS_MODEL", "tts-1"),
+    os.getenv("AUDIO_TTS_MODEL", "tts-1"),  # OpenAI default model
 )
 
 AUDIO_TTS_VOICE = PersistentConfig(
     "AUDIO_TTS_VOICE",
     "audio.tts.voice",
-    os.getenv("AUDIO_TTS_VOICE", "alloy"),
+    os.getenv("AUDIO_TTS_VOICE", "alloy"),  # OpenAI default voice
 )
 
-
-####################################
-# Database
-####################################
-
-DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{DATA_DIR}/webui.db")
-
-# Replace the postgres:// with postgresql://
-if "postgres://" in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://")
+AUDIO_TTS_SPLIT_ON = PersistentConfig(
+    "AUDIO_TTS_SPLIT_ON",
+    "audio.tts.split_on",
+    os.getenv("AUDIO_TTS_SPLIT_ON", "punctuation"),
+)

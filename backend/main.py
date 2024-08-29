@@ -1,7 +1,6 @@
 import base64
 import uuid
 from contextlib import asynccontextmanager
-
 from authlib.integrations.starlette_client import OAuth
 from authlib.oidc.core import UserInfo
 import json
@@ -13,9 +12,8 @@ import aiohttp
 import requests
 import mimetypes
 import shutil
-import os
-import uuid
 import inspect
+from typing import Optional
 
 from fastapi import FastAPI, Request, Depends, status, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
@@ -29,7 +27,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import StreamingResponse, Response, RedirectResponse
 
 
-from apps.socket.main import sio, app as socket_app, get_event_emitter, get_event_call
+from apps.socket.main import app as socket_app, get_event_emitter, get_event_call
 from apps.ollama.main import (
     app as ollama_app,
     get_all_models as get_ollama_models,
@@ -53,15 +51,13 @@ from apps.webui.internal.db import Session
 
 
 from pydantic import BaseModel
-from typing import List, Optional
 
 from apps.webui.models.auths import Auths
 from apps.webui.models.models import Models
-from apps.webui.models.tools import Tools
 from apps.webui.models.functions import Functions
-from apps.webui.models.users import Users
+from apps.webui.models.users import Users, UserModel
 
-from apps.webui.utils import load_toolkit_module_by_id, load_function_module_by_id
+from apps.webui.utils import load_function_module_by_id
 
 from utils.utils import (
     get_admin_user,
@@ -70,21 +66,27 @@ from utils.utils import (
     get_http_authorization_cred,
     get_password_hash,
     create_token,
+    decode_token,
 )
 from utils.task import (
     title_generation_template,
     search_query_generation_template,
     tools_function_calling_generation_template,
+    moa_response_generation_template,
 )
+
+from utils.tools import get_tools
 from utils.misc import (
     get_last_user_message,
     add_or_update_system_message,
+    prepend_to_first_user_message_content,
     parse_duration,
 )
 
 from apps.rag.utils import get_rag_context, rag_template
 
 from config import (
+    run_migrations,
     WEBUI_NAME,
     WEBUI_URL,
     WEBUI_AUTH,
@@ -117,7 +119,9 @@ from config import (
     WEBUI_SECRET_KEY,
     WEBUI_SESSION_COOKIE_SAME_SITE,
     WEBUI_SESSION_COOKIE_SECURE,
+    ENABLE_ADMIN_CHAT_ACCESS,
     AppConfig,
+    CORS_ALLOW_ORIGIN,
 )
 
 from constants import ERROR_MESSAGES, WEBHOOK_MESSAGES, TASKS
@@ -161,17 +165,6 @@ https://github.com/open-webui/open-webui
 )
 
 
-def run_migrations():
-    try:
-        from alembic.config import Config
-        from alembic import command
-
-        alembic_cfg = Config("alembic.ini")
-        command.upgrade(alembic_cfg, "head")
-    except Exception as e:
-        print(f"Error: {e}")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
@@ -208,33 +201,12 @@ app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = (
 
 app.state.MODELS = {}
 
-origins = ["*"]
-
 
 ##################################
 #
 # ChatCompletion Middleware
 #
 ##################################
-
-
-async def get_body_and_model_and_user(request):
-    # Read the original request body
-    body = await request.body()
-    body_str = body.decode("utf-8")
-    body = json.loads(body_str) if body_str else {}
-
-    model_id = body["model"]
-    if model_id not in app.state.MODELS:
-        raise Exception("Model not found")
-    model = app.state.MODELS[model_id]
-
-    user = get_current_user(
-        request,
-        get_http_authorization_cred(request.headers.get("Authorization")),
-    )
-
-    return body, model, user
 
 
 def get_task_model_id(default_model_id):
@@ -261,6 +233,7 @@ def get_filter_function_ids(model):
     def get_priority(function_id):
         function = Functions.get_function_by_id(function_id)
         if function is not None and hasattr(function, "valves"):
+            # TODO: Fix FunctionModel
             return (function.valves if function.valves else {}).get("priority", 0)
         return 0
 
@@ -282,164 +255,7 @@ def get_filter_function_ids(model):
     return filter_ids
 
 
-async def get_function_call_response(
-    messages,
-    files,
-    tool_id,
-    template,
-    task_model_id,
-    user,
-    __event_emitter__=None,
-    __event_call__=None,
-):
-    tool = Tools.get_tool_by_id(tool_id)
-    tools_specs = json.dumps(tool.specs, indent=2)
-    content = tools_function_calling_generation_template(template, tools_specs)
-
-    user_message = get_last_user_message(messages)
-    prompt = (
-        "History:\n"
-        + "\n".join(
-            [
-                f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
-                for message in messages[::-1][:4]
-            ]
-        )
-        + f"\nQuery: {user_message}"
-    )
-
-    print(prompt)
-
-    payload = {
-        "model": task_model_id,
-        "messages": [
-            {"role": "system", "content": content},
-            {"role": "user", "content": f"Query: {prompt}"},
-        ],
-        "stream": False,
-        "task": str(TASKS.FUNCTION_CALLING),
-    }
-
-    try:
-        payload = filter_pipeline(payload, user)
-    except Exception as e:
-        raise e
-
-    model = app.state.MODELS[task_model_id]
-
-    response = None
-    try:
-        response = await generate_chat_completions(form_data=payload, user=user)
-        content = None
-
-        if hasattr(response, "body_iterator"):
-            async for chunk in response.body_iterator:
-                data = json.loads(chunk.decode("utf-8"))
-                content = data["choices"][0]["message"]["content"]
-
-            # Cleanup any remaining background tasks if necessary
-            if response.background is not None:
-                await response.background()
-        else:
-            content = response["choices"][0]["message"]["content"]
-
-        if content is None:
-            return None, None, False
-
-        # Parse the function response
-        print(f"content: {content}")
-        result = json.loads(content)
-        print(result)
-
-        citation = None
-
-        if "name" not in result:
-            return None, None, False
-
-        # Call the function
-        if tool_id in webui_app.state.TOOLS:
-            toolkit_module = webui_app.state.TOOLS[tool_id]
-        else:
-            toolkit_module, _ = load_toolkit_module_by_id(tool_id)
-            webui_app.state.TOOLS[tool_id] = toolkit_module
-
-        file_handler = False
-        # check if toolkit_module has file_handler self variable
-        if hasattr(toolkit_module, "file_handler"):
-            file_handler = True
-            print("file_handler: ", file_handler)
-
-        if hasattr(toolkit_module, "valves") and hasattr(toolkit_module, "Valves"):
-            valves = Tools.get_tool_valves_by_id(tool_id)
-            toolkit_module.valves = toolkit_module.Valves(**(valves if valves else {}))
-
-        function = getattr(toolkit_module, result["name"])
-        function_result = None
-        try:
-            # Get the signature of the function
-            sig = inspect.signature(function)
-            params = result["parameters"]
-
-            # Extra parameters to be passed to the function
-            extra_params = {
-                "__model__": model,
-                "__id__": tool_id,
-                "__messages__": messages,
-                "__files__": files,
-                "__event_emitter__": __event_emitter__,
-                "__event_call__": __event_call__,
-            }
-
-            # Add extra params in contained in function signature
-            for key, value in extra_params.items():
-                if key in sig.parameters:
-                    params[key] = value
-
-            if "__user__" in sig.parameters:
-                # Call the function with the '__user__' parameter included
-                __user__ = {
-                    "id": user.id,
-                    "email": user.email,
-                    "name": user.name,
-                    "role": user.role,
-                }
-
-                try:
-                    if hasattr(toolkit_module, "UserValves"):
-                        __user__["valves"] = toolkit_module.UserValves(
-                            **Tools.get_user_valves_by_id_and_user_id(tool_id, user.id)
-                        )
-                except Exception as e:
-                    print(e)
-
-                params = {**params, "__user__": __user__}
-
-            if inspect.iscoroutinefunction(function):
-                function_result = await function(**params)
-            else:
-                function_result = function(**params)
-
-            if hasattr(toolkit_module, "citation") and toolkit_module.citation:
-                citation = {
-                    "source": {"name": f"TOOL:{tool.name}/{result['name']}"},
-                    "document": [function_result],
-                    "metadata": [{"source": result["name"]}],
-                }
-        except Exception as e:
-            print(e)
-
-        # Add the function result to the system prompt
-        if function_result is not None:
-            return function_result, citation, file_handler
-    except Exception as e:
-        print(f"Error: {e}")
-
-    return None, None, False
-
-
-async def chat_completion_functions_handler(
-    body, model, user, __event_emitter__, __event_call__
-):
+async def chat_completion_filter_functions_handler(body, model, extra_params):
     skip_files = None
 
     filter_ids = get_filter_function_ids(model)
@@ -472,40 +288,25 @@ async def chat_completion_functions_handler(
 
             # Get the signature of the function
             sig = inspect.signature(inlet)
-            params = {"body": body}
-
-            # Extra parameters to be passed to the function
-            extra_params = {
-                "__model__": model,
-                "__id__": filter_id,
-                "__event_emitter__": __event_emitter__,
-                "__event_call__": __event_call__,
+            params = {"body": body} | {
+                k: v
+                for k, v in {
+                    **extra_params,
+                    "__model__": model,
+                    "__id__": filter_id,
+                }.items()
+                if k in sig.parameters
             }
 
-            # Add extra params in contained in function signature
-            for key, value in extra_params.items():
-                if key in sig.parameters:
-                    params[key] = value
-
-            if "__user__" in sig.parameters:
-                __user__ = {
-                    "id": user.id,
-                    "email": user.email,
-                    "name": user.name,
-                    "role": user.role,
-                }
-
+            if "__user__" in params and hasattr(function_module, "UserValves"):
                 try:
-                    if hasattr(function_module, "UserValves"):
-                        __user__["valves"] = function_module.UserValves(
-                            **Functions.get_user_valves_by_id_and_user_id(
-                                filter_id, user.id
-                            )
+                    params["__user__"]["valves"] = function_module.UserValves(
+                        **Functions.get_user_valves_by_id_and_user_id(
+                            filter_id, params["__user__"]["id"]
                         )
+                    )
                 except Exception as e:
                     print(e)
-
-                params = {**params, "__user__": __user__}
 
             if inspect.iscoroutinefunction(inlet):
                 body = await inlet(**params)
@@ -516,74 +317,149 @@ async def chat_completion_functions_handler(
             print(f"Error: {e}")
             raise e
 
-    if skip_files:
-        if "files" in body:
-            del body["files"]
+    if skip_files and "files" in body.get("metadata", {}):
+        del body["metadata"]["files"]
 
     return body, {}
 
 
-async def chat_completion_tools_handler(body, user, __event_emitter__, __event_call__):
-    skip_files = None
+def get_tools_function_calling_payload(messages, task_model_id, content):
+    user_message = get_last_user_message(messages)
+    history = "\n".join(
+        f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
+        for message in messages[::-1][:4]
+    )
 
-    contexts = []
-    citations = None
+    prompt = f"History:\n{history}\nQuery: {user_message}"
 
-    task_model_id = get_task_model_id(body["model"])
-
-    # If tool_ids field is present, call the functions
-    if "tool_ids" in body:
-        print(body["tool_ids"])
-        for tool_id in body["tool_ids"]:
-            print(tool_id)
-            try:
-                response, citation, file_handler = await get_function_call_response(
-                    messages=body["messages"],
-                    files=body.get("files", []),
-                    tool_id=tool_id,
-                    template=app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
-                    task_model_id=task_model_id,
-                    user=user,
-                    __event_emitter__=__event_emitter__,
-                    __event_call__=__event_call__,
-                )
-
-                print(file_handler)
-                if isinstance(response, str):
-                    contexts.append(response)
-
-                if citation:
-                    if citations is None:
-                        citations = [citation]
-                    else:
-                        citations.append(citation)
-
-                if file_handler:
-                    skip_files = True
-
-            except Exception as e:
-                print(f"Error: {e}")
-        del body["tool_ids"]
-        print(f"tool_contexts: {contexts}")
-
-    if skip_files:
-        if "files" in body:
-            del body["files"]
-
-    return body, {
-        **({"contexts": contexts} if contexts is not None else {}),
-        **({"citations": citations} if citations is not None else {}),
+    return {
+        "model": task_model_id,
+        "messages": [
+            {"role": "system", "content": content},
+            {"role": "user", "content": f"Query: {prompt}"},
+        ],
+        "stream": False,
+        "metadata": {"task": str(TASKS.FUNCTION_CALLING)},
     }
 
 
-async def chat_completion_files_handler(body):
+async def get_content_from_response(response) -> Optional[str]:
+    content = None
+    if hasattr(response, "body_iterator"):
+        async for chunk in response.body_iterator:
+            data = json.loads(chunk.decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+
+        # Cleanup any remaining background tasks if necessary
+        if response.background is not None:
+            await response.background()
+    else:
+        content = response["choices"][0]["message"]["content"]
+    return content
+
+
+async def chat_completion_tools_handler(
+    body: dict, user: UserModel, extra_params: dict
+) -> tuple[dict, dict]:
+    # If tool_ids field is present, call the functions
+    metadata = body.get("metadata", {})
+
+    tool_ids = metadata.get("tool_ids", None)
+    log.debug(f"{tool_ids=}")
+    if not tool_ids:
+        return body, {}
+
+    skip_files = False
     contexts = []
-    citations = None
+    citations = []
 
-    if "files" in body:
-        files = body["files"]
-        del body["files"]
+    task_model_id = get_task_model_id(body["model"])
+    tools = get_tools(
+        webui_app,
+        tool_ids,
+        user,
+        {
+            **extra_params,
+            "__model__": app.state.MODELS[task_model_id],
+            "__messages__": body["messages"],
+            "__files__": metadata.get("files", []),
+        },
+    )
+    log.info(f"{tools=}")
 
+    specs = [tool["spec"] for tool in tools.values()]
+    tools_specs = json.dumps(specs)
+
+    tools_function_calling_prompt = tools_function_calling_generation_template(
+        app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE, tools_specs
+    )
+    log.info(f"{tools_function_calling_prompt=}")
+    payload = get_tools_function_calling_payload(
+        body["messages"], task_model_id, tools_function_calling_prompt
+    )
+
+    try:
+        payload = filter_pipeline(payload, user)
+    except Exception as e:
+        raise e
+
+    try:
+        response = await generate_chat_completions(form_data=payload, user=user)
+        log.debug(f"{response=}")
+        content = await get_content_from_response(response)
+        log.debug(f"{content=}")
+
+        if not content:
+            return body, {}
+
+        result = json.loads(content)
+
+        tool_function_name = result.get("name", None)
+        if tool_function_name not in tools:
+            return body, {}
+
+        tool_function_params = result.get("parameters", {})
+
+        try:
+            tool_output = await tools[tool_function_name]["callable"](
+                **tool_function_params
+            )
+        except Exception as e:
+            tool_output = str(e)
+
+        if tools[tool_function_name]["citation"]:
+            citations.append(
+                {
+                    "source": {
+                        "name": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                    },
+                    "document": [tool_output],
+                    "metadata": [{"source": tool_function_name}],
+                }
+            )
+        if tools[tool_function_name]["file_handler"]:
+            skip_files = True
+
+        if isinstance(tool_output, str):
+            contexts.append(tool_output)
+
+    except Exception as e:
+        log.exception(f"Error: {e}")
+        content = None
+
+    log.debug(f"tool_contexts: {contexts}")
+
+    if skip_files and "files" in body.get("metadata", {}):
+        del body["metadata"]["files"]
+
+    return body, {"contexts": contexts, "citations": citations}
+
+
+async def chat_completion_files_handler(body) -> tuple[dict, dict[str, list]]:
+    contexts = []
+    citations = []
+
+    if files := body.get("metadata", {}).get("files", None):
         contexts, citations = get_rag_context(
             files=files,
             messages=body["messages"],
@@ -596,96 +472,122 @@ async def chat_completion_files_handler(body):
 
         log.debug(f"rag_contexts: {contexts}, citations: {citations}")
 
-    return body, {
-        **({"contexts": contexts} if contexts is not None else {}),
-        **({"citations": citations} if citations is not None else {}),
-    }
+    return body, {"contexts": contexts, "citations": citations}
+
+
+def is_chat_completion_request(request):
+    return request.method == "POST" and any(
+        endpoint in request.url.path
+        for endpoint in ["/ollama/api/chat", "/chat/completions"]
+    )
+
+
+async def get_body_and_model_and_user(request):
+    # Read the original request body
+    body = await request.body()
+    body_str = body.decode("utf-8")
+    body = json.loads(body_str) if body_str else {}
+
+    model_id = body["model"]
+    if model_id not in app.state.MODELS:
+        raise Exception("Model not found")
+    model = app.state.MODELS[model_id]
+
+    user = get_current_user(
+        request,
+        get_http_authorization_cred(request.headers.get("Authorization")),
+    )
+
+    return body, model, user
 
 
 class ChatCompletionMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.method == "POST" and any(
-            endpoint in request.url.path
-            for endpoint in ["/ollama/api/chat", "/chat/completions"]
-        ):
-            log.debug(f"request.url.path: {request.url.path}")
+        if not is_chat_completion_request(request):
+            return await call_next(request)
+        log.debug(f"request.url.path: {request.url.path}")
 
-            try:
-                body, model, user = await get_body_and_model_and_user(request)
-            except Exception as e:
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content={"detail": str(e)},
-                )
-
-            # Extract valves from the request body
-            valves = None
-            if "valves" in body:
-                valves = body["valves"]
-                del body["valves"]
-
-            # Extract session_id, chat_id and message_id from the request body
-            session_id = None
-            if "session_id" in body:
-                session_id = body["session_id"]
-                del body["session_id"]
-            chat_id = None
-            if "chat_id" in body:
-                chat_id = body["chat_id"]
-                del body["chat_id"]
-            message_id = None
-            if "id" in body:
-                message_id = body["id"]
-                del body["id"]
-
-            __event_emitter__ = await get_event_emitter(
-                {"chat_id": chat_id, "message_id": message_id, "session_id": session_id}
-            )
-            __event_call__ = await get_event_call(
-                {"chat_id": chat_id, "message_id": message_id, "session_id": session_id}
+        try:
+            body, model, user = await get_body_and_model_and_user(request)
+        except Exception as e:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": str(e)},
             )
 
-            # Initialize data_items to store additional data to be sent to the client
-            data_items = []
+        metadata = {
+            "chat_id": body.pop("chat_id", None),
+            "message_id": body.pop("id", None),
+            "session_id": body.pop("session_id", None),
+            "tool_ids": body.get("tool_ids", None),
+            "files": body.get("files", None),
+        }
+        body["metadata"] = metadata
 
-            # Initialize context, and citations
-            contexts = []
-            citations = []
+        extra_params = {
+            "__event_emitter__": get_event_emitter(metadata),
+            "__event_call__": get_event_call(metadata),
+            "__user__": {
+                "id": user.id,
+                "email": user.email,
+                "name": user.name,
+                "role": user.role,
+            },
+        }
 
-            try:
-                body, flags = await chat_completion_functions_handler(
-                    body, model, user, __event_emitter__, __event_call__
+        # Initialize data_items to store additional data to be sent to the client
+        # Initalize contexts and citation
+        data_items = []
+        contexts = []
+        citations = []
+
+        try:
+            body, flags = await chat_completion_filter_functions_handler(
+                body, model, extra_params
+            )
+        except Exception as e:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": str(e)},
+            )
+
+        metadata = {
+            **metadata,
+            "tool_ids": body.pop("tool_ids", None),
+            "files": body.pop("files", None),
+        }
+        body["metadata"] = metadata
+
+        try:
+            body, flags = await chat_completion_tools_handler(body, user, extra_params)
+            contexts.extend(flags.get("contexts", []))
+            citations.extend(flags.get("citations", []))
+        except Exception as e:
+            log.exception(e)
+
+        try:
+            body, flags = await chat_completion_files_handler(body)
+            contexts.extend(flags.get("contexts", []))
+            citations.extend(flags.get("citations", []))
+        except Exception as e:
+            log.exception(e)
+
+        # If context is not empty, insert it into the messages
+        if len(contexts) > 0:
+            context_string = "/n".join(contexts).strip()
+            prompt = get_last_user_message(body["messages"])
+            if prompt is None:
+                raise Exception("No user message found")
+            # Workaround for Ollama 2.0+ system prompt issue
+            # TODO: replace with add_or_update_system_message
+            if model["owned_by"] == "ollama":
+                body["messages"] = prepend_to_first_user_message_content(
+                    rag_template(
+                        rag_app.state.config.RAG_TEMPLATE, context_string, prompt
+                    ),
+                    body["messages"],
                 )
-            except Exception as e:
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content={"detail": str(e)},
-                )
-
-            try:
-                body, flags = await chat_completion_tools_handler(
-                    body, user, __event_emitter__, __event_call__
-                )
-
-                contexts.extend(flags.get("contexts", []))
-                citations.extend(flags.get("citations", []))
-            except Exception as e:
-                print(e)
-                pass
-
-            try:
-                body, flags = await chat_completion_files_handler(body)
-
-                contexts.extend(flags.get("contexts", []))
-                citations.extend(flags.get("citations", []))
-            except Exception as e:
-                print(e)
-                pass
-
-            # If context is not empty, insert it into the messages
-            if len(contexts) > 0:
-                context_string = "/n".join(contexts).strip()
-                prompt = get_last_user_message(body["messages"])
+            else:
                 body["messages"] = add_or_update_system_message(
                     rag_template(
                         rag_app.state.config.RAG_TEMPLATE, context_string, prompt
@@ -693,67 +595,43 @@ class ChatCompletionMiddleware(BaseHTTPMiddleware):
                     body["messages"],
                 )
 
-            # If there are citations, add them to the data_items
-            if len(citations) > 0:
-                data_items.append({"citations": citations})
+        # If there are citations, add them to the data_items
+        if len(citations) > 0:
+            data_items.append({"citations": citations})
 
-            body["metadata"] = {
-                "session_id": session_id,
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "valves": valves,
-            }
+        modified_body_bytes = json.dumps(body).encode("utf-8")
+        # Replace the request body with the modified one
+        request._body = modified_body_bytes
+        # Set custom header to ensure content-length matches new body length
+        request.headers.__dict__["_list"] = [
+            (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
+            *[(k, v) for k, v in request.headers.raw if k.lower() != b"content-length"],
+        ]
 
-            modified_body_bytes = json.dumps(body).encode("utf-8")
-            # Replace the request body with the modified one
-            request._body = modified_body_bytes
-            # Set custom header to ensure content-length matches new body length
-            request.headers.__dict__["_list"] = [
-                (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
-                *[
-                    (k, v)
-                    for k, v in request.headers.raw
-                    if k.lower() != b"content-length"
-                ],
-            ]
-
-            response = await call_next(request)
-            if isinstance(response, StreamingResponse):
-                # If it's a streaming response, inject it as SSE event or NDJSON line
-                content_type = response.headers.get("Content-Type")
-                if "text/event-stream" in content_type:
-                    return StreamingResponse(
-                        self.openai_stream_wrapper(response.body_iterator, data_items),
-                    )
-                if "application/x-ndjson" in content_type:
-                    return StreamingResponse(
-                        self.ollama_stream_wrapper(response.body_iterator, data_items),
-                    )
-
-                return response
-            else:
-                return response
-
-        # If it's not a chat completion request, just pass it through
         response = await call_next(request)
-        return response
+        if not isinstance(response, StreamingResponse):
+            return response
+
+        content_type = response.headers["Content-Type"]
+        is_openai = "text/event-stream" in content_type
+        is_ollama = "application/x-ndjson" in content_type
+        if not is_openai and not is_ollama:
+            return response
+
+        def wrap_item(item):
+            return f"data: {item}\n\n" if is_openai else f"{item}\n"
+
+        async def stream_wrapper(original_generator, data_items):
+            for item in data_items:
+                yield wrap_item(json.dumps(item))
+
+            async for data in original_generator:
+                yield data
+
+        return StreamingResponse(stream_wrapper(response.body_iterator, data_items))
 
     async def _receive(self, body: bytes):
         return {"type": "http.request", "body": body, "more_body": False}
-
-    async def openai_stream_wrapper(self, original_generator, data_items):
-        for item in data_items:
-            yield f"data: {json.dumps(item)}\n\n"
-
-        async for data in original_generator:
-            yield data
-
-    async def ollama_stream_wrapper(self, original_generator, data_items):
-        for item in data_items:
-            yield f"{json.dumps(item)}\n"
-
-        async for data in original_generator:
-            yield data
 
 
 app.add_middleware(ChatCompletionMiddleware)
@@ -802,19 +680,21 @@ def filter_pipeline(payload, user):
             url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
             key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
 
-            if key != "":
-                headers = {"Authorization": f"Bearer {key}"}
-                r = requests.post(
-                    f"{url}/{filter['id']}/filter/inlet",
-                    headers=headers,
-                    json={
-                        "user": user,
-                        "body": payload,
-                    },
-                )
+            if key == "":
+                continue
 
-                r.raise_for_status()
-                payload = r.json()
+            headers = {"Authorization": f"Bearer {key}"}
+            r = requests.post(
+                f"{url}/{filter['id']}/filter/inlet",
+                headers=headers,
+                json={
+                    "user": user,
+                    "body": payload,
+                },
+            )
+
+            r.raise_for_status()
+            payload = r.json()
         except Exception as e:
             # Handle connection error here
             print(f"Connection error: {e}")
@@ -829,44 +709,39 @@ def filter_pipeline(payload, user):
 
 class PipelineMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.method == "POST" and (
-            "/ollama/api/chat" in request.url.path
-            or "/chat/completions" in request.url.path
-        ):
-            log.debug(f"request.url.path: {request.url.path}")
+        if not is_chat_completion_request(request):
+            return await call_next(request)
 
-            # Read the original request body
-            body = await request.body()
-            # Decode body to string
-            body_str = body.decode("utf-8")
-            # Parse string to JSON
-            data = json.loads(body_str) if body_str else {}
+        log.debug(f"request.url.path: {request.url.path}")
 
-            user = get_current_user(
-                request,
-                get_http_authorization_cred(request.headers.get("Authorization")),
+        # Read the original request body
+        body = await request.body()
+        # Decode body to string
+        body_str = body.decode("utf-8")
+        # Parse string to JSON
+        data = json.loads(body_str) if body_str else {}
+
+        user = get_current_user(
+            request,
+            get_http_authorization_cred(request.headers["Authorization"]),
+        )
+
+        try:
+            data = filter_pipeline(data, user)
+        except Exception as e:
+            return JSONResponse(
+                status_code=e.args[0],
+                content={"detail": e.args[1]},
             )
 
-            try:
-                data = filter_pipeline(data, user)
-            except Exception as e:
-                return JSONResponse(
-                    status_code=e.args[0],
-                    content={"detail": e.args[1]},
-                )
-
-            modified_body_bytes = json.dumps(data).encode("utf-8")
-            # Replace the request body with the modified one
-            request._body = modified_body_bytes
-            # Set custom header to ensure content-length matches new body length
-            request.headers.__dict__["_list"] = [
-                (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
-                *[
-                    (k, v)
-                    for k, v in request.headers.raw
-                    if k.lower() != b"content-length"
-                ],
-            ]
+        modified_body_bytes = json.dumps(data).encode("utf-8")
+        # Replace the request body with the modified one
+        request._body = modified_body_bytes
+        # Set custom header to ensure content-length matches new body length
+        request.headers.__dict__["_list"] = [
+            (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
+            *[(k, v) for k, v in request.headers.raw if k.lower() != b"content-length"],
+        ]
 
         response = await call_next(request)
         return response
@@ -880,7 +755,7 @@ app.add_middleware(PipelineMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=CORS_ALLOW_ORIGIN,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -970,7 +845,7 @@ async def get_all_models():
 
     custom_models = Models.get_all_models()
     for custom_model in custom_models:
-        if custom_model.base_model_id == None:
+        if custom_model.base_model_id is None:
             for model in models:
                 if (
                     custom_model.id == model["id"]
@@ -979,32 +854,15 @@ async def get_all_models():
                     model["name"] = custom_model.name
                     model["info"] = custom_model.model_dump()
 
-                    action_ids = [] + global_action_ids
+                    action_ids = []
                     if "info" in model and "meta" in model["info"]:
                         action_ids.extend(model["info"]["meta"].get("actionIds", []))
-                        action_ids = list(set(action_ids))
-                    action_ids = [
-                        action_id
-                        for action_id in action_ids
-                        if action_id in enabled_action_ids
-                    ]
 
-                    model["actions"] = []
-                    for action_id in action_ids:
-                        action = Functions.get_function_by_id(action_id)
-                        model["actions"].append(
-                            {
-                                "id": action_id,
-                                "name": action.name,
-                                "description": action.meta.description,
-                                "icon_url": action.meta.manifest.get("icon_url", None),
-                            }
-                        )
-
+                    model["action_ids"] = action_ids
         else:
             owned_by = "openai"
             pipe = None
-            actions = []
+            action_ids = []
 
             for model in models:
                 if (
@@ -1015,26 +873,8 @@ async def get_all_models():
                     if "pipe" in model:
                         pipe = model["pipe"]
 
-                    action_ids = [] + global_action_ids
                     if "info" in model and "meta" in model["info"]:
                         action_ids.extend(model["info"]["meta"].get("actionIds", []))
-                        action_ids = list(set(action_ids))
-                    action_ids = [
-                        action_id
-                        for action_id in action_ids
-                        if action_id in enabled_action_ids
-                    ]
-
-                    actions = [
-                        {
-                            "id": action_id,
-                            "name": Functions.get_function_by_id(action_id).name,
-                            "description": Functions.get_function_by_id(
-                                action_id
-                            ).meta.description,
-                        }
-                        for action_id in action_ids
-                    ]
                     break
 
             models.append(
@@ -1047,9 +887,66 @@ async def get_all_models():
                     "info": custom_model.model_dump(),
                     "preset": True,
                     **({"pipe": pipe} if pipe is not None else {}),
-                    "actions": actions,
+                    "action_ids": action_ids,
                 }
             )
+
+    for model in models:
+        action_ids = []
+        if "action_ids" in model:
+            action_ids = model["action_ids"]
+            del model["action_ids"]
+
+        action_ids = action_ids + global_action_ids
+        action_ids = list(set(action_ids))
+        action_ids = [
+            action_id for action_id in action_ids if action_id in enabled_action_ids
+        ]
+
+        model["actions"] = []
+        for action_id in action_ids:
+            action = Functions.get_function_by_id(action_id)
+            if action is None:
+                raise Exception(f"Action not found: {action_id}")
+
+            if action_id in webui_app.state.FUNCTIONS:
+                function_module = webui_app.state.FUNCTIONS[action_id]
+            else:
+                function_module, _, _ = load_function_module_by_id(action_id)
+                webui_app.state.FUNCTIONS[action_id] = function_module
+
+            __webui__ = False
+            if hasattr(function_module, "__webui__"):
+                __webui__ = function_module.__webui__
+
+            if hasattr(function_module, "actions"):
+                actions = function_module.actions
+                model["actions"].extend(
+                    [
+                        {
+                            "id": f"{action_id}.{_action['id']}",
+                            "name": _action.get(
+                                "name", f"{action.name} ({_action['id']})"
+                            ),
+                            "description": action.meta.description,
+                            "icon_url": _action.get(
+                                "icon_url", action.meta.manifest.get("icon_url", None)
+                            ),
+                            **({"__webui__": __webui__} if __webui__ else {}),
+                        }
+                        for _action in actions
+                    ]
+                )
+            else:
+                model["actions"].append(
+                    {
+                        "id": action_id,
+                        "name": action.name,
+                        "description": action.meta.description,
+                        "icon_url": action.meta.manifest.get("icon_url", None),
+                        **({"__webui__": __webui__} if __webui__ else {}),
+                    }
+                )
 
     app.state.MODELS = {model["id"]: model for model in models}
     webui_app.state.MODELS = app.state.MODELS
@@ -1084,29 +981,24 @@ async def get_models(user=Depends(get_verified_user)):
 @app.post("/api/chat/completions")
 async def generate_chat_completions(form_data: dict, user=Depends(get_verified_user)):
     model_id = form_data["model"]
+
     if model_id not in app.state.MODELS:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Model not found",
         )
+
+    if app.state.config.ENABLE_MODEL_FILTER:
+        if user.role == "user" and model_id not in app.state.config.MODEL_FILTER_LIST:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Model not found",
+            )
+
     model = app.state.MODELS[model_id]
-
-    # `task` field is used to determine the type of the request, e.g. `title_generation`, `query_generation`, etc.
-    task = None
-    if "task" in form_data:
-        task = form_data["task"]
-        del form_data["task"]
-
-    if task:
-        if "metadata" in form_data:
-            form_data["metadata"]["task"] = task
-        else:
-            form_data["metadata"] = {"task": task}
-
     if model.get("pipe"):
         return await generate_function_chat_completion(form_data, user=user)
     if model["owned_by"] == "ollama":
-        print("generate_ollama_chat_completion")
         return await generate_ollama_chat_completion(form_data, user=user)
     else:
         return await generate_openai_chat_completion(form_data, user=user)
@@ -1165,13 +1057,13 @@ async def chat_completed(form_data: dict, user=Depends(get_verified_user)):
                             status_code=r.status_code,
                             content=res,
                         )
-                except:
+                except Exception:
                     pass
 
             else:
                 pass
 
-    __event_emitter__ = await get_event_emitter(
+    __event_emitter__ = get_event_emitter(
         {
             "chat_id": data["chat_id"],
             "message_id": data["id"],
@@ -1179,7 +1071,7 @@ async def chat_completed(form_data: dict, user=Depends(get_verified_user)):
         }
     )
 
-    __event_call__ = await get_event_call(
+    __event_call__ = get_event_call(
         {
             "chat_id": data["chat_id"],
             "message_id": data["id"],
@@ -1190,6 +1082,7 @@ async def chat_completed(form_data: dict, user=Depends(get_verified_user)):
     def get_priority(function_id):
         function = Functions.get_function_by_id(function_id)
         if function is not None and hasattr(function, "valves"):
+            # TODO: Fix FunctionModel to include vavles
             return (function.valves if function.valves else {}).get("priority", 0)
         return 0
 
@@ -1284,9 +1177,12 @@ async def chat_completed(form_data: dict, user=Depends(get_verified_user)):
 
 
 @app.post("/api/chat/actions/{action_id}")
-async def chat_completed(
-    action_id: str, form_data: dict, user=Depends(get_verified_user)
-):
+async def chat_action(action_id: str, form_data: dict, user=Depends(get_verified_user)):
+    if "." in action_id:
+        action_id, sub_action_id = action_id.split(".")
+    else:
+        sub_action_id = None
+
     action = Functions.get_function_by_id(action_id)
     if not action:
         raise HTTPException(
@@ -1303,14 +1199,14 @@ async def chat_completed(
         )
     model = app.state.MODELS[model_id]
 
-    __event_emitter__ = await get_event_emitter(
+    __event_emitter__ = get_event_emitter(
         {
             "chat_id": data["chat_id"],
             "message_id": data["id"],
             "session_id": data["session_id"],
         }
     )
-    __event_call__ = await get_event_call(
+    __event_call__ = get_event_call(
         {
             "chat_id": data["chat_id"],
             "message_id": data["id"],
@@ -1339,7 +1235,7 @@ async def chat_completed(
             # Extra parameters to be passed to the function
             extra_params = {
                 "__model__": model,
-                "__id__": action_id,
+                "__id__": sub_action_id if sub_action_id is not None else action_id,
                 "__event_emitter__": __event_emitter__,
                 "__event_call__": __event_call__,
             }
@@ -1476,7 +1372,7 @@ async def generate_title(form_data: dict, user=Depends(get_verified_user)):
         "stream": False,
         "max_tokens": 50,
         "chat_id": form_data.get("chat_id", None),
-        "task": str(TASKS.TITLE_GENERATION),
+        "metadata": {"task": str(TASKS.TITLE_GENERATION)},
     }
 
     log.debug(payload)
@@ -1529,7 +1425,7 @@ async def generate_search_query(form_data: dict, user=Depends(get_verified_user)
         "messages": [{"role": "user", "content": content}],
         "stream": False,
         "max_tokens": 30,
-        "task": str(TASKS.QUERY_GENERATION),
+        "metadata": {"task": str(TASKS.QUERY_GENERATION)},
     }
 
     print(payload)
@@ -1586,7 +1482,7 @@ Message: """{{prompt}}"""
         "stream": False,
         "max_tokens": 4,
         "chat_id": form_data.get("chat_id", None),
-        "task": str(TASKS.EMOJI_GENERATION),
+        "metadata": {"task": str(TASKS.EMOJI_GENERATION)},
     }
 
     log.debug(payload)
@@ -1605,9 +1501,9 @@ Message: """{{prompt}}"""
     return await generate_chat_completions(form_data=payload, user=user)
 
 
-@app.post("/api/task/tools/completions")
-async def get_tools_function_calling(form_data: dict, user=Depends(get_verified_user)):
-    print("get_tools_function_calling")
+@app.post("/api/task/moa/completions")
+async def generate_moa_response(form_data: dict, user=Depends(get_verified_user)):
+    print("generate_moa_response")
 
     model_id = form_data["model"]
     if model_id not in app.state.MODELS:
@@ -1619,25 +1515,42 @@ async def get_tools_function_calling(form_data: dict, user=Depends(get_verified_
     # Check if the user has a custom task model
     # If the user has a custom task model, use that model
     model_id = get_task_model_id(model_id)
-
     print(model_id)
-    template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
+
+    template = """You have been provided with a set of responses from various models to the latest user query: "{{prompt}}"
+
+Your task is to synthesize these responses into a single, high-quality response. It is crucial to critically evaluate the information provided in these responses, recognizing that some of it may be biased or incorrect. Your response should not simply replicate the given answers but should offer a refined, accurate, and comprehensive reply to the instruction. Ensure your response is well-structured, coherent, and adheres to the highest standards of accuracy and reliability.
+
+Responses from models: {{responses}}"""
+
+    content = moa_response_generation_template(
+        template,
+        form_data["prompt"],
+        form_data["responses"],
+    )
+
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": content}],
+        "stream": form_data.get("stream", False),
+        "chat_id": form_data.get("chat_id", None),
+        "metadata": {"task": str(TASKS.MOA_RESPONSE_GENERATION)},
+    }
+
+    log.debug(payload)
 
     try:
-        context, _, _ = await get_function_call_response(
-            form_data["messages"],
-            form_data.get("files", []),
-            form_data["tool_id"],
-            template,
-            model_id,
-            user,
-        )
-        return context
+        payload = filter_pipeline(payload, user)
     except Exception as e:
         return JSONResponse(
             status_code=e.args[0],
             content={"detail": e.args[1]},
         )
+
+    if "chat_id" in payload:
+        del payload["chat_id"]
+
+    return await generate_chat_completions(form_data=payload, user=user)
 
 
 ##################################
@@ -1658,7 +1571,7 @@ async def get_pipelines_list(user=Depends(get_admin_user)):
     urlIdxs = [
         idx
         for idx, response in enumerate(responses)
-        if response != None and "pipelines" in response
+        if response is not None and "pipelines" in response
     ]
 
     return {
@@ -1678,7 +1591,7 @@ async def upload_pipeline(
 ):
     print("upload_pipeline", urlIdx, file.filename)
     # Check if the uploaded file is a python file
-    if not file.filename.endswith(".py"):
+    if not (file.filename and file.filename.endswith(".py")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only Python (.py) files are allowed.",
@@ -1719,7 +1632,7 @@ async def upload_pipeline(
                 res = r.json()
                 if "detail" in res:
                     detail = res["detail"]
-            except:
+            except Exception:
                 pass
 
         raise HTTPException(
@@ -1739,7 +1652,6 @@ class AddPipelineForm(BaseModel):
 
 @app.post("/api/pipelines/add")
 async def add_pipeline(form_data: AddPipelineForm, user=Depends(get_admin_user)):
-
     r = None
     try:
         urlIdx = form_data.urlIdx
@@ -1766,7 +1678,7 @@ async def add_pipeline(form_data: AddPipelineForm, user=Depends(get_admin_user))
                 res = r.json()
                 if "detail" in res:
                     detail = res["detail"]
-            except:
+            except Exception:
                 pass
 
         raise HTTPException(
@@ -1782,7 +1694,6 @@ class DeletePipelineForm(BaseModel):
 
 @app.delete("/api/pipelines/delete")
 async def delete_pipeline(form_data: DeletePipelineForm, user=Depends(get_admin_user)):
-
     r = None
     try:
         urlIdx = form_data.urlIdx
@@ -1809,7 +1720,7 @@ async def delete_pipeline(form_data: DeletePipelineForm, user=Depends(get_admin_
                 res = r.json()
                 if "detail" in res:
                     detail = res["detail"]
-            except:
+            except Exception:
                 pass
 
         raise HTTPException(
@@ -1842,7 +1753,7 @@ async def get_pipelines(urlIdx: Optional[int] = None, user=Depends(get_admin_use
                 res = r.json()
                 if "detail" in res:
                     detail = res["detail"]
-            except:
+            except Exception:
                 pass
 
         raise HTTPException(
@@ -1857,10 +1768,8 @@ async def get_pipeline_valves(
     pipeline_id: str,
     user=Depends(get_admin_user),
 ):
-    models = await get_all_models()
     r = None
     try:
-
         url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
         key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
 
@@ -1882,7 +1791,7 @@ async def get_pipeline_valves(
                 res = r.json()
                 if "detail" in res:
                     detail = res["detail"]
-            except:
+            except Exception:
                 pass
 
         raise HTTPException(
@@ -1897,8 +1806,6 @@ async def get_pipeline_valves_spec(
     pipeline_id: str,
     user=Depends(get_admin_user),
 ):
-    models = await get_all_models()
-
     r = None
     try:
         url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
@@ -1921,7 +1828,7 @@ async def get_pipeline_valves_spec(
                 res = r.json()
                 if "detail" in res:
                     detail = res["detail"]
-            except:
+            except Exception:
                 pass
 
         raise HTTPException(
@@ -1937,8 +1844,6 @@ async def update_pipeline_valves(
     form_data: dict,
     user=Depends(get_admin_user),
 ):
-    models = await get_all_models()
-
     r = None
     try:
         url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
@@ -1966,7 +1871,7 @@ async def update_pipeline_valves(
                 res = r.json()
                 if "detail" in res:
                     detail = res["detail"]
-            except:
+            except Exception:
                 pass
 
         raise HTTPException(
@@ -1983,38 +1888,66 @@ async def update_pipeline_valves(
 
 
 @app.get("/api/config")
-async def get_app_config():
+async def get_app_config(request: Request):
+    user = None
+    if "token" in request.cookies:
+        token = request.cookies.get("token")
+        data = decode_token(token)
+        if data is not None and "id" in data:
+            user = Users.get_user_by_id(data["id"])
+
     return {
         "status": True,
         "name": WEBUI_NAME,
         "version": VERSION,
         "default_locale": str(DEFAULT_LOCALE),
-        "default_models": webui_app.state.config.DEFAULT_MODELS,
-        "default_prompt_suggestions": webui_app.state.config.DEFAULT_PROMPT_SUGGESTIONS,
-        "features": {
-            "auth": WEBUI_AUTH,
-            "auth_trusted_header": bool(webui_app.state.AUTH_TRUSTED_EMAIL_HEADER),
-            "enable_signup": webui_app.state.config.ENABLE_SIGNUP,
-            "enable_web_search": rag_app.state.config.ENABLE_RAG_WEB_SEARCH,
-            "enable_image_generation": images_app.state.config.ENABLED,
-            "enable_community_sharing": webui_app.state.config.ENABLE_COMMUNITY_SHARING,
-            "enable_admin_export": ENABLE_ADMIN_EXPORT,
-        },
-        "audio": {
-            "tts": {
-                "engine": audio_app.state.config.TTS_ENGINE,
-                "voice": audio_app.state.config.TTS_VOICE,
-            },
-            "stt": {
-                "engine": audio_app.state.config.STT_ENGINE,
-            },
-        },
         "oauth": {
             "providers": {
                 name: config.get("name", name)
                 for name, config in OAUTH_PROVIDERS.items()
             }
         },
+        "features": {
+            "auth": WEBUI_AUTH,
+            "auth_trusted_header": bool(webui_app.state.AUTH_TRUSTED_EMAIL_HEADER),
+            "enable_signup": webui_app.state.config.ENABLE_SIGNUP,
+            "enable_login_form": webui_app.state.config.ENABLE_LOGIN_FORM,
+            **(
+                {
+                    "enable_web_search": rag_app.state.config.ENABLE_RAG_WEB_SEARCH,
+                    "enable_image_generation": images_app.state.config.ENABLED,
+                    "enable_community_sharing": webui_app.state.config.ENABLE_COMMUNITY_SHARING,
+                    "enable_message_rating": webui_app.state.config.ENABLE_MESSAGE_RATING,
+                    "enable_admin_export": ENABLE_ADMIN_EXPORT,
+                    "enable_admin_chat_access": ENABLE_ADMIN_CHAT_ACCESS,
+                }
+                if user is not None
+                else {}
+            ),
+        },
+        **(
+            {
+                "default_models": webui_app.state.config.DEFAULT_MODELS,
+                "default_prompt_suggestions": webui_app.state.config.DEFAULT_PROMPT_SUGGESTIONS,
+                "audio": {
+                    "tts": {
+                        "engine": audio_app.state.config.TTS_ENGINE,
+                        "voice": audio_app.state.config.TTS_VOICE,
+                        "split_on": audio_app.state.config.TTS_SPLIT_ON,
+                    },
+                    "stt": {
+                        "engine": audio_app.state.config.STT_ENGINE,
+                    },
+                },
+                "file": {
+                    "max_size": rag_app.state.config.FILE_MAX_SIZE,
+                    "max_count": rag_app.state.config.FILE_MAX_COUNT,
+                },
+                "permissions": {**webui_app.state.config.USER_PERMISSIONS},
+            }
+            if user is not None
+            else {}
+        ),
     }
 
 
@@ -2028,7 +1961,7 @@ async def get_model_filter_config(user=Depends(get_admin_user)):
 
 class ModelFilterConfigForm(BaseModel):
     enabled: bool
-    models: List[str]
+    models: list[str]
 
 
 @app.post("/api/config/model/filter")
@@ -2066,7 +1999,7 @@ async def update_webhook_url(form_data: UrlForm, user=Depends(get_admin_user)):
 
 
 @app.get("/api/version")
-async def get_app_config():
+async def get_app_version():
     return {
         "version": VERSION,
     }
@@ -2089,7 +2022,7 @@ async def get_app_latest_release_version():
                 latest_version = data["tag_name"]
 
                 return {"current": VERSION, "latest": latest_version[1:]}
-    except aiohttp.ClientError as e:
+    except aiohttp.ClientError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
@@ -2111,6 +2044,7 @@ for provider_name, provider_config in OAUTH_PROVIDERS.items():
         client_kwargs={
             "scope": provider_config["scope"],
         },
+        redirect_uri=provider_config["redirect_uri"],
     )
 
 # SessionMiddleware is used by authlib for oauth
@@ -2128,8 +2062,14 @@ if len(OAUTH_PROVIDERS) > 0:
 async def oauth_login(provider: str, request: Request):
     if provider not in OAUTH_PROVIDERS:
         raise HTTPException(404)
-    redirect_uri = request.url_for("oauth_callback", provider=provider)
-    return await oauth.create_client(provider).authorize_redirect(request, redirect_uri)
+    # If the provider has a custom redirect URL, use that, otherwise automatically generate one
+    redirect_uri = OAUTH_PROVIDERS[provider].get("redirect_uri") or request.url_for(
+        "oauth_callback", provider=provider
+    )
+    client = oauth.create_client(provider)
+    if client is None:
+        raise HTTPException(404)
+    return await client.authorize_redirect(request, redirect_uri)
 
 
 # OAuth login logic is as follows:
@@ -2155,7 +2095,8 @@ async def oauth_callback(provider: str, request: Request, response: Response):
         log.warning(f"OAuth callback failed, sub is missing: {user_data}")
         raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
     provider_sub = f"{provider}@{sub}"
-    email = user_data.get("email", "").lower()
+    email_claim = webui_app.state.config.OAUTH_EMAIL_CLAIM
+    email = user_data.get(email_claim, "").lower()
     # We currently mandate that email addresses are provided
     if not email:
         log.warning(f"OAuth callback failed, email is missing: {user_data}")
@@ -2260,7 +2201,20 @@ async def get_manifest_json():
         "display": "standalone",
         "background_color": "#343541",
         "orientation": "portrait-primary",
-        "icons": [{"src": "/static/logo.png", "type": "image/png", "sizes": "500x500"}],
+        "icons": [
+            {
+                "src": "/static/logo.png",
+                "type": "image/png",
+                "sizes": "500x500",
+                "purpose": "any",
+            },
+            {
+                "src": "/static/logo.png",
+                "type": "image/png",
+                "sizes": "500x500",
+                "purpose": "maskable",
+            },
+        ],
     }
 
 

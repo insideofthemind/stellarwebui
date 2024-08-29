@@ -2,7 +2,7 @@ import os
 import logging
 import requests
 
-from typing import List, Union
+from typing import Union
 
 from apps.ollama.main import (
     generate_ollama_embeddings,
@@ -142,28 +142,32 @@ def merge_and_sort_query_results(query_results, k, reverse=False):
 
 
 def query_collection(
-    collection_names: List[str],
+    collection_names: list[str],
     query: str,
     embedding_function,
     k: int,
 ):
     results = []
     for collection_name in collection_names:
-        try:
-            result = query_doc(
-                collection_name=collection_name,
-                query=query,
-                k=k,
-                embedding_function=embedding_function,
-            )
-            results.append(result)
-        except:
+        if collection_name:
+            try:
+                result = query_doc(
+                    collection_name=collection_name,
+                    query=query,
+                    k=k,
+                    embedding_function=embedding_function,
+                )
+                results.append(result)
+            except Exception:
+                pass
+        else:
             pass
+
     return merge_and_sort_query_results(results, k=k)
 
 
 def query_collection_with_hybrid_search(
-    collection_names: List[str],
+    collection_names: list[str],
     query: str,
     embedding_function,
     k: int,
@@ -182,7 +186,7 @@ def query_collection_with_hybrid_search(
                 r=r,
             )
             results.append(result)
-        except:
+        except Exception:
             pass
     return merge_and_sort_query_results(results, k=k, reverse=True)
 
@@ -257,7 +261,7 @@ def get_rag_context(
         collection_names = (
             file["collection_names"]
             if file["type"] == "collection"
-            else [file["collection_name"]]
+            else [file["collection_name"]] if file["collection_name"] else []
         )
 
         collection_names = set(collection_names).difference(extracted_collections)
@@ -411,7 +415,7 @@ class ChromaRetriever(BaseRetriever):
         query: str,
         *,
         run_manager: CallbackManagerForRetrieverRun,
-    ) -> List[Document]:
+    ) -> list[Document]:
         query_embeddings = self.embedding_function(query)
 
         results = self.collection.query(
